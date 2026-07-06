@@ -6,6 +6,8 @@ use dbus::channel::MatchingReceiver;
 use dbus::message::MatchRule;
 use dbus::strings::Interface;
 
+mod notifications;
+
 // This programs implements the equivalent of running the "dbus-monitor" tool
 fn main() {
     // Very simple argument parsing.
