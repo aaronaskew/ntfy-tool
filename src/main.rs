@@ -1,103 +1,120 @@
-use std::time::Duration;
+use futures_util::stream::TryStreamExt;
+use image::{RgbImage, RgbaImage};
+use std::collections::HashMap;
+use zbus::{Connection, MessageStream, zvariant::OwnedValue};
 
-use dbus::Message;
-use dbus::blocking::Connection;
-use dbus::channel::MatchingReceiver;
-use dbus::message::MatchRule;
-use dbus::strings::Interface;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Connect to the session bus
+    let connection = Connection::session().await?;
 
-mod notifications;
+    // 2. Become a monitor to eavesdrop on all method calls to the Notifications interface
+    let rules = &["type='method_call',interface='org.freedesktop.Notifications',member='Notify'"];
+    connection
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus.Monitoring"),
+            "BecomeMonitor",
+            &(rules as &[&str], 0u32),
+        )
+        .await?;
 
-// This programs implements the equivalent of running the "dbus-monitor" tool
-fn main() {
-    // Very simple argument parsing.
-    let use_system_bus = std::env::args().into_iter().any(|a| a == "--system");
+    println!("Listening for Discord notifications on D-Bus...");
 
-    // First open up a connection to the desired bus.
-    let conn = (if use_system_bus {
-        Connection::new_system()
-    } else {
-        Connection::new_session()
-    })
-    .expect("D-Bus connection failed");
+    // 3. Listen to the stream of messages
+    let mut stream = MessageStream::from(connection);
 
-    // Second create a rule to match messages we want to receive; in this example we add no
-    // further requirements, so all messages will match
-    let rule = MatchRule::new();
-
-    // Try matching using new scheme
-    let proxy = conn.with_proxy(
-        "org.freedesktop.DBus",
-        "/org/freedesktop/DBus",
-        Duration::from_millis(5000),
-    );
-    let result: Result<(), dbus::Error> = proxy.method_call(
-        "org.freedesktop.DBus.Monitoring",
-        "BecomeMonitor",
-        (vec![rule.match_str()], 0u32),
-    );
-
-    match result {
-        // BecomeMonitor was successful, start listening for messages
-        Ok(_) => {
-            conn.start_receive(
-                rule,
-                Box::new(|msg, _| {
-                    handle_message(&msg);
-                    true
-                }),
-            );
+    while let Some(msg) = stream.try_next().await? {
+        // We only care about MethodCall messages
+        if msg.header().message_type() != zbus::message::Type::MethodCall {
+            continue;
         }
-        // BecomeMonitor failed, fallback to using the old scheme
-        Err(e) => {
-            eprintln!(
-                "Failed to BecomeMonitor: '{}', falling back to eavesdrop",
-                e
-            );
 
-            // First, we'll try "eavesdrop", which as the name implies lets us receive
-            // *all* messages, not just ours.
-            let rule_with_eavesdrop = {
-                let mut rule = rule.clone();
-                rule.eavesdrop = true;
-                rule
-            };
+        // The D-Bus signature for the 'Notify' method is (susssasa{sv}i)
+        type NotifyArgs = (
+            String,                      // 0: app_name
+            u32,                         // 1: replaces_id
+            String,                      // 2: app_icon
+            String,                      // 3: summary
+            String,                      // 4: body
+            Vec<String>,                 // 5: actions
+            HashMap<String, OwnedValue>, // 6: hints
+            i32,                         // 7: timeout
+        );
 
-            let result = conn.add_match(rule_with_eavesdrop, |_: (), _, msg| {
-                handle_message(msg);
-                true
-            });
+        let body = msg.body();
+        let args: Result<NotifyArgs, _> = body.deserialize();
 
-            match result {
-                Ok(_) => {
-                    // success, we're now listening
-                }
-                // This can sometimes fail, for example when listening to the system bus as a non-root user.
-                // So, just like `dbus-monitor`, we attempt to fallback without `eavesdrop=true`:
-                Err(e) => {
-                    eprintln!("Failed to eavesdrop: '{}', trying without it", e);
-                    conn.add_match(rule, |_: (), _, msg| {
-                        handle_message(msg);
-                        true
-                    })
-                    .expect("add_match failed");
+        if let Ok(args) = args {
+            let app_name = args.0;
+            let summary = args.3;
+            let hints = args.6;
+
+            // Filter for Discord notifications only
+            if app_name.to_lowercase() == "discord" {
+                println!("\n[Discord] Notification Summary: {}", summary);
+
+                // Check standard keys for image payload inside the hints dictionary
+                let image_data_val = hints
+                    .get("image-data")
+                    .or_else(|| hints.get("image_data"))
+                    .or_else(|| hints.get("icon_data"));
+
+                if let Some(val) = image_data_val {
+                    // Desktop Notifications Spec image data signature: (iiibiiay)
+                    type ImageData = (i32, i32, i32, bool, i32, i32, Vec<u8>);
+
+                    let parsed_image: Result<ImageData, _> = val.clone().try_into();
+
+                    if let Ok(image_data) = parsed_image {
+                        let (width, height, _rowstride, has_alpha, _bits, channels, data) =
+                            image_data;
+
+                        println!(
+                            " -> Found image data: {}x{} pixels, {} channels",
+                            width, height, channels
+                        );
+
+                        // Define a unique filename
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        let filename = format!("images/discord_img_{}.png", timestamp);
+
+                        // Parse the raw bytes back into an image file
+                        let width = width as u32;
+                        let height = height as u32;
+
+                        if has_alpha && channels == 4 {
+                            if let Some(img) = RgbaImage::from_raw(width, height, data) {
+                                img.save(&filename)?;
+                                println!(" -> Successfully saved image to: {}", filename);
+                            }
+                        } else if !has_alpha && channels == 3 {
+                            if let Some(img) = RgbImage::from_raw(width, height, data) {
+                                img.save(&filename)?;
+                                println!(" -> Successfully saved image to: {}", filename);
+                            }
+                        } else {
+                            println!(
+                                " -> Unsupported image format: alpha={}, channels={}",
+                                has_alpha, channels
+                            );
+                        }
+                    } else {
+                        println!(" -> Failed to deserialize image structure from D-Bus payload.");
+                    }
+                } else if let Some(path) = hints.get("image-path") {
+                    // Occasionally apps might just pass a local file path as a string
+                    println!(" -> Found an image path instead: {:?}", path);
+                } else {
+                    println!(" -> No image data attached to this notification.");
                 }
             }
         }
     }
 
-    // Loop and print out all messages received (using handle_message()) as they come.
-    // Some can be quite large, e.g. if they contain embedded images..
-    loop {
-        conn.process(Duration::from_millis(1000)).unwrap();
-    }
-}
-
-fn handle_message(msg: &Message) {
-    if let Ok(desktop_notifications_interface) = Interface::new("org.freedesktop.Notifications")
-        && let Some(interface) = msg.interface()
-        && interface == desktop_notifications_interface
-    {
-        println!("Got notification: {:?}", msg);
-    }
+    Ok(())
 }
